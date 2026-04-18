@@ -1,0 +1,27 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# DuckDB database files (too large, should be regeneratable)
+*.duckdb
+*.duckdb.wal
+
+# Raw API pulls (regeneratable from the ingestion script)
+raw/*.json
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Environment variables / secrets (never commit API keys)
+.env
