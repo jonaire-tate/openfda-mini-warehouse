@@ -1,11 +1,6 @@
 """
-ingest.py
-
-Phase 1 of the openFDA Drug Events Mini-Warehouse.
-
-Pulls adverse event reports for narcolepsy medications from the openFDA API,
-saves the raw JSON as a backup, and loads the records into a DuckDB table
-called raw_adverse_events.
+Pull adverse event reports for narcolepsy medications from openFDA,
+save the raw JSON to disk, and load it into DuckDB as raw_adverse_events.
 """
 
 import json
@@ -24,26 +19,26 @@ API_URL = "https://api.fda.gov/drug/event.json"
 # Narcolepsy medications (Jazz Pharmaceuticals therapeutic area)
 DRUGS = ["XYREM", "XYWAV", "WAKIX", "SUNOSI"]
 
-# Where the raw JSON backup goes
+# Where the raw JSON backups go (immutable raw layer)
 RAW_DIR = Path("raw")
 
 # Where the DuckDB database file lives
 DB_PATH = "data/warehouse.duckdb"
 
-# Records per API call (openFDA caps this at 1000)
+# openFDA caps responses at 1000 records per call; using 100 for politeness
 PAGE_SIZE = 100
 
-# Total records to pull per drug (we'll stop when we hit this, or when the API runs out)
+# Total records to pull per drug. 4 drugs * 500 = 2000 records total.
 MAX_PER_DRUG = 500
+
 
 # ---------- API fetch ----------
 
 def fetch_drug_events(drug_name, max_records=MAX_PER_DRUG):
-    """
-    Pull adverse event reports from openFDA for a single drug.
+    """Fetch up to max_records adverse event reports for a single drug.
 
-    Uses pagination because the API returns a limited number of records per call.
-    Returns a list of raw JSON records (each record is a dict).
+    Uses pagination via the skip parameter. Stops when max_records is hit
+    or when the API runs out of results.
     """
     all_records = []
     skip = 0
@@ -56,38 +51,34 @@ def fetch_drug_events(drug_name, max_records=MAX_PER_DRUG):
         }
 
         print(f"  Fetching {drug_name}: records {skip} to {skip + PAGE_SIZE}...")
-
         response = requests.get(API_URL, params=params, timeout=30)
 
-        # openFDA returns 404 when there are no more results, which is normal
+        # openFDA returns 404 when there are no more results, not an empty list
         if response.status_code == 404:
             print(f"  No more records for {drug_name}.")
             break
 
-        response.raise_for_status()  # Raise an error if anything else went wrong
-        data = response.json()
-
-        results = data.get("results", [])
+        response.raise_for_status()
+        results = response.json().get("results", [])
         if not results:
             break
 
         all_records.extend(results)
         skip += PAGE_SIZE
 
-        # Be polite to the API
+        # Be polite to a free public API
         time.sleep(0.5)
 
-    # Trim to max in case the last page put us over
     return all_records[:max_records]
 
-# ---------- Save raw JSON backup ----------
+
+# ---------- Raw JSON backup ----------
 
 def save_raw_backup(drug_name, records):
-    """
-    Save the list of records to raw/<drug_name>.json.
+    """Save records to raw/<drug>.json as an immutable backup.
 
-    This is our immutable raw layer. If anything goes wrong downstream,
-    we can re-read from these files instead of hitting the API again.
+    If anything breaks in the DuckDB load later, the raw JSON can be
+    reloaded without hitting the API again.
     """
     RAW_DIR.mkdir(exist_ok=True)
     output_path = RAW_DIR / f"{drug_name}.json"
@@ -97,25 +88,20 @@ def save_raw_backup(drug_name, records):
 
     print(f"  Saved {len(records)} records to {output_path}")
 
-# ---------- Load into DuckDB ----------
+
+# ---------- DuckDB load ----------
 
 def load_into_duckdb(all_records):
-    """
-    Load the combined list of records into DuckDB as raw_adverse_events.
+    """Load records into raw_adverse_events as JSON strings.
 
-    The raw layer stores each record as a JSON string in a single column.
-    We deliberately don't flatten or parse here. That's the warehouse
-    layer's job in Phase 2.
+    Schema-on-read pattern: the raw layer stores data exactly as openFDA
+    returned it. Parsing and flattening happen in Phase 2 (warehouse layer).
     """
-    # Make sure the data folder exists
     Path("data").mkdir(exist_ok=True)
-
     con = duckdb.connect(DB_PATH)
 
-    # Drop the table if it exists, so re-running the script starts clean
+    # Drop and recreate so re-running is idempotent
     con.execute("DROP TABLE IF EXISTS raw_adverse_events")
-
-    # Create the raw table. One column: the full JSON record as a string.
     con.execute("""
         CREATE TABLE raw_adverse_events (
             record_json VARCHAR,
@@ -123,30 +109,22 @@ def load_into_duckdb(all_records):
         )
     """)
 
-    # Insert each record as a JSON string
+    # executemany with a parameterized insert is the safe way to bulk load
     rows = [(json.dumps(r),) for r in all_records]
     con.executemany(
         "INSERT INTO raw_adverse_events (record_json) VALUES (?)",
         rows
     )
 
-    # Verify the load
     count = con.execute("SELECT COUNT(*) FROM raw_adverse_events").fetchone()[0]
     print(f"\nLoaded {count} records into raw_adverse_events.")
-
     con.close()
+
 
 # ---------- Main ----------
 
 def main():
-    """
-    Run the full Phase 1 ingestion:
-    1. Fetch adverse event records for each drug from openFDA
-    2. Save raw JSON backups
-    3. Load everything into DuckDB as raw_adverse_events
-    """
     print("Starting openFDA ingestion...\n")
-
     all_records = []
 
     for drug in DRUGS:
@@ -166,7 +144,7 @@ def main():
         return
 
     load_into_duckdb(all_records)
-    print("\nPhase 1 ingestion complete.")
+    print("\nIngestion complete.")
 
 
 if __name__ == "__main__":
